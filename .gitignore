@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+.env
+mlruns/
+outputs/
+data/
+*.pt
+*.pth
+*.zip
+*.tar
+*.tgz
+*.onnx
