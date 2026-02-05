@@ -7,26 +7,36 @@ MNIST CNN demo (training only):
 - Logs params/metrics/artifacts + run metadata
 - DOES NOT create any Model Registry entries / versions
 
-Promotion happens separately in scripts/30_promote.py.
+Dataset selection:
+- REQUIRED: DATASET_RUN_ID=<run_id from dataset experiment>
+- Optional: USE_MATERIALIZED_DATASET=true to train from dataset tarballs logged on that run
 
 Env controls:
-- MNIST_MAX_TRAIN (default 2000)
-- MNIST_MAX_TEST  (default 500)
-- MNIST_EPOCHS    (default 10)
+- DATASET_RUN_ID                (required)
+- USE_MATERIALIZED_DATASET      (default false)
+- MNIST_MAX_TRAIN               (default 2000)
+- MNIST_MAX_TEST                (default 500)
+- MNIST_EPOCHS                  (default 10)
 """
 
 import os
+import io
 import json
+import tarfile
 from datetime import datetime, UTC
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, Dataset
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
-from util import load_config, ensure_dir, write_json, sha256_file
+import mlflow
+from mlflow.tracking import MlflowClient
+
+from util import load_config, ensure_dir, write_json, sha256_file, require_env
 from gitlab_mlops import Client
 
 
@@ -39,15 +49,18 @@ def utc_iso_z() -> str:
 
 
 def utc_compact() -> str:
-    # Safe characters for identifiers / filenames.
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
+def is_truthy(x) -> bool:
+    if x is None:
+        return False
+    s = str(x).strip().lower()
+    return s in {"1", "true", "yes", "y", "on"}
+
+
 def get_run_ref(run) -> str:
-    """
-    Different versions of gitlab_mlops client expose different identifiers.
-    Prefer run_id, then external_id, then id.
-    """
+    # gitlab_mlops run objects differ by version
     return (
         getattr(run, "run_id", None)
         or getattr(run, "external_id", None)
@@ -63,6 +76,68 @@ def safe_slug(s: str) -> str:
         out.append(ch if ch.isalnum() else "-")
     slug = "".join(out).strip("-")
     return slug or "run"
+
+
+# -------------------------
+# optional: materialized dataset loading
+# -------------------------
+
+class MaterializedMNISTDataset(Dataset):
+    """
+    Loads .npy images + labels.json from the tarballs produced by create_dataset.py.
+    """
+    def __init__(self, tar_path: str):
+        self.samples = []  # list of (np.ndarray, int)
+        with tarfile.open(tar_path, "r:gz") as tf:
+            labels_member = None
+            for m in tf.getmembers():
+                if m.name.endswith("/labels.json"):
+                    labels_member = m
+                    break
+            if labels_member is None:
+                raise RuntimeError(f"No labels.json found in {tar_path}")
+
+            labels = json.loads(tf.extractfile(labels_member).read().decode("utf-8"))
+
+            for name, y in sorted(labels.items()):
+                if not name.endswith(".npy"):
+                    continue
+                f = tf.extractfile(name)
+                if f is None:
+                    continue
+                b = f.read()
+                arr = np.load(io.BytesIO(b), allow_pickle=False)
+                self.samples.append((arr, int(y)))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        arr, y = self.samples[idx]
+        x = torch.from_numpy(arr)
+
+        # arr may be HxW (28x28) OR 1xHxW (1x28x28) depending on how it was saved
+        if x.ndim == 2:
+            x = x.unsqueeze(0)  # -> 1xHxW
+        elif x.ndim == 3 and x.shape[0] != 1:
+            # If someone saved HxWxC, convert to CxHxW
+            x = x.permute(2, 0, 1)
+
+        x = x.float() / 255.0
+        return x, torch.tensor(int(y), dtype=torch.long)
+
+
+
+def download_materialized_tarballs(mlc: MlflowClient, dataset_run_id: str, out_dir: str):
+    """
+    Downloads train/test tarballs from the dataset run artifacts:
+      dataset/materialized/mnist_small_train.tar.gz
+      dataset/materialized/mnist_small_test.tar.gz
+    """
+    ensure_dir(out_dir)
+    train_tar = mlc.download_artifacts(dataset_run_id, "dataset/materialized/mnist_small_train.tar.gz", out_dir)
+    test_tar  = mlc.download_artifacts(dataset_run_id, "dataset/materialized/mnist_small_test.tar.gz", out_dir)
+    return train_tar, test_tar
 
 
 # -------------------------
@@ -107,23 +182,12 @@ def evaluate(model, loader, device):
             pred = logits.argmax(dim=1)
             correct += int((pred == y).sum().item())
             total += int(x.size(0))
-    return {
-        "loss": loss_sum / max(total, 1),
-        "accuracy": correct / max(total, 1),
-        "n": total,
-    }
+    return {"loss": loss_sum / max(total, 1), "accuracy": correct / max(total, 1), "n": total}
 
 
-def train_one_run(
-    exp,
-    run_name: str,
-    lr: float,
-    batch_size: int,
-    epochs: int,
-    max_train: int,
-    max_test: int,
-    dataset_run_ids: dict,
-):
+def train_one_run(exp, cfg, mlc: MlflowClient, dataset_run_id: str,
+                  run_name: str, lr: float, batch_size: int, epochs: int,
+                  max_train: int, max_test: int):
     run = exp.create_run()
 
     # Optional tag for nicer browsing
@@ -136,29 +200,55 @@ def train_one_run(
     created_ts = utc_iso_z()
     run_ref = get_run_ref(run)
 
-    # Promotion status starts as "none"
+    # ---- dataset provenance (required) ----
+    ds = mlc.get_run(dataset_run_id)
+    dataset_kind = ds.data.params.get("dataset_kind")
+
+    run.log_param("dataset_experiment", cfg.experiment_dataset)
+    run.log_param("dataset_run_id", dataset_run_id)
+    if dataset_kind:
+        run.log_param("dataset_kind", dataset_kind)
+
+    # copy a few useful dataset params/hashes if present
+    for k in ("manifest_sha256", "train_tar_sha256", "test_tar_sha256", "max_train", "max_test"):
+        v = ds.data.params.get(k)
+        if v is not None:
+            run.log_param(f"dataset_{k}", v)
+
+    # ---- training params ----
     run.log_param("promotion_status", "none")
     run.log_param("created_utc", created_ts)
+    run.log_param("run_ref", run_ref)
     run.log_param("run_name", run_name)
     run.log_param("lr", lr)
     run.log_param("batch_size", batch_size)
     run.log_param("epochs", epochs)
     run.log_param("max_train", max_train)
     run.log_param("max_test", max_test)
-    run.log_param("run_ref", run_ref)
-
-    # Link dataset provenance (if available)
-    for k, v in (dataset_run_ids or {}).items():
-        if v:
-            run.log_param(f"dataset_{k}", v)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     run.log_param("device", device)
 
-    tfm = transforms.Compose([transforms.ToTensor()])
-    train_ds = datasets.MNIST(root="data", train=True, download=True, transform=tfm)
-    test_ds = datasets.MNIST(root="data", train=False, download=True, transform=tfm)
+    # ---- choose data source ----
+    use_materialized = is_truthy(os.environ.get("USE_MATERIALIZED_DATASET", "false"))
+    if use_materialized:
+        if dataset_kind != "metadataset_plus_materialized":
+            raise RuntimeError(
+                "USE_MATERIALIZED_DATASET=true requires dataset_kind=metadataset_plus_materialized "
+                f"but selected dataset_kind={dataset_kind!r}"
+            )
+        dl_dir = os.path.join("outputs", "datasets_downloaded", dataset_run_id)
+        train_tar, test_tar = download_materialized_tarballs(mlc, dataset_run_id, dl_dir)
+        train_ds = MaterializedMNISTDataset(train_tar)
+        test_ds = MaterializedMNISTDataset(test_tar)
+        run.log_param("dataset_source", "materialized_tarballs")
+    else:
+        tfm = transforms.Compose([transforms.ToTensor()])
+        train_ds = datasets.MNIST(root="data", train=True, download=True, transform=tfm)
+        test_ds = datasets.MNIST(root="data", train=False, download=True, transform=tfm)
+        run.log_param("dataset_source", "torchvision_mnist_download")
 
+    # Subset for speed
     train_subset = Subset(train_ds, list(range(min(len(train_ds), max_train))))
     test_subset = Subset(test_ds, list(range(min(len(test_ds), max_test))))
 
@@ -189,7 +279,6 @@ def train_one_run(
             pbar.set_postfix(loss=float(loss.item()))
 
         metrics = evaluate(model, test_loader, device)
-        # Some clients accept step, some don't
         try:
             run.log_metric("test_loss", float(metrics["loss"]), step=epoch)
             run.log_metric("test_accuracy", float(metrics["accuracy"]), step=epoch)
@@ -197,7 +286,7 @@ def train_one_run(
             run.log_metric("test_loss", float(metrics["loss"]))
             run.log_metric("test_accuracy", float(metrics["accuracy"]))
 
-    # Save model + metadata artifacts under outputs/models/<run_name>_<timestamp>
+    # Save model + metadata artifacts
     out_dir = os.path.join("outputs", "models", f"{safe_slug(run_name)}_{utc_compact()}")
     ensure_dir(out_dir)
 
@@ -214,44 +303,40 @@ def train_one_run(
         "created_utc": created_ts,
         "hyperparams": {"lr": lr, "batch_size": batch_size, "epochs": epochs},
         "device": device,
-        "source_run_ref": run_ref,
-        "dataset_run_ids": dataset_run_ids or {},
+        "dataset": {
+            "experiment": cfg.experiment_dataset,
+            "run_id": dataset_run_id,
+            "kind": dataset_kind,
+            "source": "materialized_tarballs" if use_materialized else "torchvision_mnist_download",
+        },
         "model_state_sha256": model_sha,
         "artifact_path": "model/model_state_dict.pt",
+        "source_run_ref": run_ref,
     }
     meta_path = os.path.join(out_dir, "run_meta.json")
     write_json(meta_path, meta)
     run.log_artifact(local_path=meta_path, artifact_path="model")
 
-    return {
-        "run": run,
-        "run_ref": run_ref,
-        "run_name": run_name,
-        "model_path": model_path,
-        "meta_path": meta_path,
-        "model_state_sha256": model_sha,
-    }
+    return {"run_name": run_name, "run_ref": run_ref, "model_state_sha256": model_sha}
 
 
 def main():
     cfg = load_config()
+    dataset_run_id = require_env("DATASET_RUN_ID")
+
     client = Client(tracking_uri=cfg.tracking_uri, gitlab_token=cfg.token)
+    mlflow.set_tracking_uri(cfg.tracking_uri)
+    mlc = MlflowClient()
+
+    # Validate dataset run exists early
+    _ = mlc.get_run(dataset_run_id)
 
     exp = client.get_experiment(name=cfg.experiment_training) or client.create_experiment(cfg.experiment_training)
-
-    # Load dataset run pointers if they exist
-    pointers_path = os.path.join("outputs", "datasets", "dataset_run_pointers.json")
-    if os.path.exists(pointers_path):
-        with open(pointers_path, "r", encoding="utf-8") as f:
-            dataset_run_ids = json.load(f)
-    else:
-        dataset_run_ids = {"metadataset_run_id": None, "materialized_run_id": None}
 
     max_train = int(os.environ.get("MNIST_MAX_TRAIN", "2000"))
     max_test = int(os.environ.get("MNIST_MAX_TEST", "500"))
     epochs = int(os.environ.get("MNIST_EPOCHS", "10"))
 
-    # Example: two runs with different hyperparameters
     runspecs = [
         ("run_a", 1e-3, 64, epochs),
         ("run_b", 5e-4, 128, epochs),
@@ -259,25 +344,19 @@ def main():
 
     results = []
     for name, lr, bs, ep in runspecs:
-        r = train_one_run(
-            exp=exp,
-            run_name=name,
-            lr=lr,
-            batch_size=bs,
-            epochs=ep,
-            max_train=max_train,
-            max_test=max_test,
-            dataset_run_ids={
-                "metadataset_run_id": dataset_run_ids.get("metadataset_run_id"),
-                "materialized_run_id": dataset_run_ids.get("materialized_run_id"),
-            },
-        )
         results.append(
-            {
-                "run_name": r["run_name"],
-                "run_ref": r["run_ref"],
-                "model_state_sha256": r["model_state_sha256"],
-            }
+            train_one_run(
+                exp=exp,
+                cfg=cfg,
+                mlc=mlc,
+                dataset_run_id=dataset_run_id,
+                run_name=name,
+                lr=lr,
+                batch_size=bs,
+                epochs=ep,
+                max_train=max_train,
+                max_test=max_test,
+            )
         )
 
     ensure_dir("outputs")

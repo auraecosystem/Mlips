@@ -2,7 +2,7 @@ import os
 import io
 import json
 import tarfile
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import List, Dict
 
 import numpy as np
@@ -83,7 +83,7 @@ def main():
     run1.log_param("dataset_kind", "metadataset_only")
     run1.log_param("max_train", max_train)
     run1.log_param("max_test", max_test)
-    run1.log_param("created_utc", datetime.utcnow().isoformat() + "Z")
+    run1.log_param("created_utc", datetime.now(UTC).isoformat().replace("+00:00", "Z"))
 
     manifest_train = build_manifest(train_ds, "train", max_train)
     manifest_test = build_manifest(test_ds, "test", max_test)
@@ -111,7 +111,7 @@ def main():
     run2.log_param("dataset_kind", "metadataset_plus_materialized")
     run2.log_param("max_train", max_train)
     run2.log_param("max_test", max_test)
-    run2.log_param("created_utc", datetime.utcnow().isoformat() + "Z")
+    run2.log_param("created_utc", datetime.now(UTC).isoformat().replace("+00:00", "Z"))
 
     # reuse manifest but log separately so it is tied to run2
     run2.log_artifact(local_path=manifest_path, artifact_path="dataset")
