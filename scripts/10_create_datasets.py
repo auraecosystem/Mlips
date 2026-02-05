@@ -70,8 +70,8 @@ def main():
     max_test  = int(os.environ.get("MNIST_MAX_TEST", "500"))
 
     tfm = transforms.ToTensor()  # keeps it simple; hashing uses numpy conversion above
-    train_ds = datasets.MNIST(root="data", train=True, download=True, transform=None)
-    test_ds  = datasets.MNIST(root="data", train=False, download=True, transform=None)
+    train_ds = datasets.MNIST(root="data", train=True, download=True, transform=tfm)
+    test_ds  = datasets.MNIST(root="data", train=False, download=True, transform=tfm)
 
     # -------------------------
     # Experiment: dataset curation

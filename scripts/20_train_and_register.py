@@ -1,6 +1,21 @@
+#!/usr/bin/env python3
+"""
+scripts/20_train_and_register.py
+
+MNIST CNN demo:
+- Train two small runs (run_a/run_b) with GitLab MLOps client experiment tracking
+- Log params/metrics/artifacts
+- Promote each run to GitLab Model Registry with a SemVer-compliant version string
+
+Key fixes:
+- No datetime.utcnow() (timezone-aware UTC everywhere)
+- SemVer-safe model version strings (no ':' in build metadata)
+- version is passed explicitly into promote_to_model_registry()
+"""
+
 import os
 import json
-from datetime import datetime
+from datetime import datetime, UTC
 
 import torch
 import torch.nn as nn
@@ -14,6 +29,39 @@ from util import load_config, ensure_dir, write_json, sha256_file
 # GitLab MLOps Python Client
 from gitlab_mlops import Client
 
+
+# -------------------------
+# helpers
+# -------------------------
+
+def utc_iso_z() -> str:
+    """UTC timestamp in ISO 8601, Z-suffixed, timezone-aware."""
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def utc_compact() -> str:
+    """
+    Compact UTC timestamp safe for SemVer build metadata:
+    only [0-9A-Za-z-] and no ':'.
+    Example: 20260202T214119Z
+    """
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def semver_version(run_name: str, base: str = "0.1.0") -> str:
+    """
+    Produce a SemVer-compliant version string that is unique per run.
+    We use build metadata for uniqueness and traceability.
+    Example: 0.1.0+20260202T214119Z.run_a
+    """
+    # run_name should be safe (letters/numbers/_). Replace underscores with hyphens to be safe.
+    safe_run = "".join(ch if ch.isalnum() else "-" for ch in run_name).strip("-")
+    return f"{base}+{utc_compact()}.{safe_run}"
+
+
+# -------------------------
+# model
+# -------------------------
 
 class SimpleCNN(nn.Module):
     def __init__(self):
@@ -60,15 +108,26 @@ def evaluate(model, loader, device):
     }
 
 
-def train_one_run(exp, run_name: str, lr: float, batch_size: int, epochs: int, max_train: int, max_test: int, dataset_run_ids: dict):
+def train_one_run(
+    exp,
+    run_name: str,
+    lr: float,
+    batch_size: int,
+    epochs: int,
+    max_train: int,
+    max_test: int,
+    dataset_run_ids: dict,
+):
     # Create run
     run = exp.create_run()
     if hasattr(run, "set_tag"):
-        # Some client versions might provide run.set_tag; keep optional.
         try:
             run.set_tag("run_name", run_name)
         except Exception:
             pass
+
+    created_ts = utc_iso_z()
+    version = semver_version(run_name=run_name, base="0.1.0")
 
     # Log params
     run.log_param("run_name", run_name)
@@ -77,10 +136,11 @@ def train_one_run(exp, run_name: str, lr: float, batch_size: int, epochs: int, m
     run.log_param("epochs", epochs)
     run.log_param("max_train", max_train)
     run.log_param("max_test", max_test)
-    run.log_param("created_utc", datetime.utcnow().isoformat() + "Z")
+    run.log_param("created_utc", created_ts)
+    run.log_param("model_registry_version", version)
 
     # Link to dataset runs
-    for k, v in dataset_run_ids.items():
+    for k, v in (dataset_run_ids or {}).items():
         if v:
             run.log_param(f"dataset_{k}", v)
 
@@ -89,14 +149,14 @@ def train_one_run(exp, run_name: str, lr: float, batch_size: int, epochs: int, m
 
     tfm = transforms.Compose([transforms.ToTensor()])
     train_ds = datasets.MNIST(root="data", train=True, download=True, transform=tfm)
-    test_ds  = datasets.MNIST(root="data", train=False, download=True, transform=tfm)
+    test_ds = datasets.MNIST(root="data", train=False, download=True, transform=tfm)
 
     # Subset for speed
     train_subset = Subset(train_ds, list(range(min(len(train_ds), max_train))))
-    test_subset  = Subset(test_ds, list(range(min(len(test_ds), max_test))))
+    test_subset = Subset(test_ds, list(range(min(len(test_ds), max_test))))
 
     train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader  = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, num_workers=0)
 
     model = SimpleCNN().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -122,12 +182,10 @@ def train_one_run(exp, run_name: str, lr: float, batch_size: int, epochs: int, m
             pbar.set_postfix(loss=float(loss.item()))
 
         metrics = evaluate(model, test_loader, device)
-        # Track metrics with step=epoch where supported
         try:
             run.log_metric("test_loss", float(metrics["loss"]), step=epoch)
             run.log_metric("test_accuracy", float(metrics["accuracy"]), step=epoch)
         except TypeError:
-            # older API might not support step
             run.log_metric("test_loss", float(metrics["loss"]))
             run.log_metric("test_accuracy", float(metrics["accuracy"]))
 
@@ -143,42 +201,47 @@ def train_one_run(exp, run_name: str, lr: float, batch_size: int, epochs: int, m
     # Save run metadata artifact
     meta = {
         "run_name": run_name,
-        "created_utc": datetime.utcnow().isoformat() + "Z",
+        "created_utc": created_ts,
         "hyperparams": {"lr": lr, "batch_size": batch_size, "epochs": epochs},
         "device": device,
+        "model_registry_version": version,
+        "source_run_id": getattr(run, "run_id", None),
     }
     meta_path = os.path.join(out_dir, "run_meta.json")
     write_json(meta_path, meta)
     run.log_artifact(local_path=meta_path, artifact_path="model")
 
-    return run, model_path, meta_path
+    return run, model_path, meta_path, version
 
 
-def promote_to_model_registry(client: Client, model_name: str, run, model_path: str):
+def promote_to_model_registry(client: Client, model_name: str, run, model_path: str, version: str):
     # Create or get model entry
     model = client.get_model(name=model_name)
     if not model:
-        model = client.create_model(name=model_name, description="MNIST CNN demo model promoted from tracked runs.")
+        model = client.create_model(
+            name=model_name,
+            description="MNIST CNN demo model promoted from tracked runs.",
+        )
 
-    # Version label: use timestamp; optionally you could use semantic versions or git commit hashes
-    version = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    mv = model.create_version(description=f"Auto-promoted from run {getattr(run, 'run_id', 'unknown')}", version=version)
+    mv = model.create_version(
+        description=f"Auto-promoted from run {getattr(run, 'run_id', 'unknown')}",
+        version=version,
+    )
 
     # Attach params; keep it minimal
     mv.log_param("source_run_id", getattr(run, "run_id", "unknown"))
     mv.log_param("artifact_path", "model/model_state_dict.pt")
-    mv.log_param("promoted_utc", datetime.utcnow().isoformat() + "Z")
+    mv.log_param("model_state_sha256", sha256_file(model_path))
+    mv.log_param("promoted_utc", utc_iso_z())
 
     # Add a small README to the model version
     mv.log_text(
         "This model version was produced by scripts/20_train_and_register.py.\n"
         "It is a small MNIST CNN intended for demonstrating GitLab experiment tracking + model registry.\n",
-        "README.md"
+        "README.md",
     )
 
-    # NOTE: The current GitLab MLOps client supports log_param/log_text on model versions.
-    # Artifact attachment semantics may evolve; we keep artifacts logged to the run (MLflow), and the registry version
-    # contains the run_id reference so you can fetch the artifact from MLflow.
+    # Artifacts remain logged to the run (MLflow tracking). Registry version stores a pointer to run_id.
     return mv
 
 
@@ -191,7 +254,6 @@ def main():
 
     # Pull dataset run pointers if available
     pointers_path = os.path.join("outputs", "datasets", "dataset_run_pointers.json")
-    dataset_run_ids = {}
     if os.path.exists(pointers_path):
         with open(pointers_path, "r", encoding="utf-8") as f:
             dataset_run_ids = json.load(f)
@@ -199,7 +261,7 @@ def main():
         dataset_run_ids = {"metadataset_run_id": None, "materialized_run_id": None}
 
     max_train = int(os.environ.get("MNIST_MAX_TRAIN", "2000"))
-    max_test  = int(os.environ.get("MNIST_MAX_TEST", "500"))
+    max_test = int(os.environ.get("MNIST_MAX_TEST", "500"))
 
     # Two runs with different hyperparameters
     runspecs = [
@@ -209,7 +271,7 @@ def main():
 
     results = []
     for name, lr, bs, epochs in runspecs:
-        run, model_path, meta_path = train_one_run(
+        run, model_path, meta_path, version = train_one_run(
             exp=exp,
             run_name=name,
             lr=lr,
@@ -222,12 +284,14 @@ def main():
                 "materialized_run_id": dataset_run_ids.get("materialized_run_id"),
             },
         )
-        mv = promote_to_model_registry(client, cfg.model_name, run, model_path)
-        results.append({
-            "run_name": name,
-            "run_id": getattr(run, "run_id", None),
-            "model_version": getattr(mv, "version", None),
-        })
+        mv = promote_to_model_registry(client, cfg.model_name, run, model_path, version)
+        results.append(
+            {
+                "run_name": name,
+                "run_id": getattr(run, "run_id", None),
+                "model_version": getattr(mv, "version", None),
+            }
+        )
 
     out_summary = os.path.join("outputs", "training_summary.json")
     ensure_dir("outputs")
@@ -235,6 +299,7 @@ def main():
     print("Training complete. Summary:", out_summary)
     for r in results:
         print(r)
+
 
 if __name__ == "__main__":
     main()
